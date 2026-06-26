@@ -3,22 +3,14 @@
 mcp-fw: MCP Firewall Manager
 Fail2ban + CrowdSec + nftables — fleet-wide control via SSH
 
-Run: python server.py --port 8700
-Then: LibreChat connects via http://HOST:8700/sse
+Uses FastMCP for SSE transport.
+Run: python server.py  (defaults to port 8700)
 """
 
-import asyncio
-import json
 import subprocess
-import sys
-import argparse
 from typing import Any
 
-from mcp.server import Server
-from mcp.server.sse import SseServerTransport
-from starlette.applications import Starlette
-from starlette.routing import Route
-import uvicorn
+from mcp.server.fastmcp import FastMCP
 
 # ─── Fleet Configuration ───────────────────────────────────────────
 FLEET = {
@@ -32,6 +24,9 @@ FLEET = {
 }
 
 SSH_TIMEOUT = 15
+
+# ─── MCP Server ─────────────────────────────────────────────────────
+mcp = FastMCP("mcp-fw")
 
 
 def ssh(server: str, cmd: str, timeout: int = SSH_TIMEOUT) -> dict[str, Any]:
@@ -69,13 +64,11 @@ def ssh_sudo(server: str, cmd: str, timeout: int = SSH_TIMEOUT) -> dict[str, Any
     return ssh(server, f"sudo {cmd}", timeout)
 
 
-# ─── MCP Server ─────────────────────────────────────────────────────
-app = Server("mcp-fw")
+# ─── Tools ──────────────────────────────────────────────────────────
 
-
-@app.tool()
+@mcp.tool()
 async def fw_fleet_summary() -> str:
-    """סיכום חומת אש לכל הצי — Fail2ban + CrowdSec + nftables. מראה איזה שרתים פעילים ואיזה שכבות FW רצות."""
+    """סיכום חומת אש לכל הצי — Fail2ban + CrowdSec + nftables."""
     results = {}
     for name in FLEET:
         r = ssh(name, "echo OK; systemctl is-active fail2ban 2>/dev/null; systemctl is-active crowdsec 2>/dev/null; sudo nft list table ip filter 2>/dev/null | head -1")
@@ -101,9 +94,9 @@ async def fw_fleet_summary() -> str:
     return "\n".join(lines)
 
 
-@app.tool()
+@mcp.tool()
 async def fw_fail2ban_status(server: str = "all") -> str:
-    """מצב Fail2ban: jails, IPs חסומים, סטטיסטיקות. server=שם שרת או all."""
+    """מצב Fail2ban: jails, IPs חסומים. server=שם שרת או all."""
     servers = list(FLEET.keys()) if server == "all" else [server]
     lines = ["## 🛡️ Fail2ban Status\n"]
 
@@ -123,27 +116,27 @@ async def fw_fail2ban_status(server: str = "all") -> str:
     return "\n".join(lines)
 
 
-@app.tool()
+@mcp.tool()
 async def fw_fail2ban_ban(server: str, jail: str, ip: str) -> str:
-    """חסום IP ידנית ב-Fail2ban. server=שם שרת, jail=sshd/asterisk, ip=כתובת."""
+    """חסום IP ב-Fail2ban. server=שרת, jail=sshd/asterisk, ip=כתובת."""
     r = ssh_sudo(server, f"fail2ban-client set {jail} banip {ip}")
     if r.get("ok"):
         return f"✅ {ip} נחסם ב-{jail} על {server}"
     return f"❌ כשל: {r.get('stderr', r.get('error'))}"
 
 
-@app.tool()
+@mcp.tool()
 async def fw_fail2ban_unban(server: str, jail: str, ip: str) -> str:
-    """שחרר IP מחסימה ב-Fail2ban."""
+    """שחרר IP מ-Fail2ban."""
     r = ssh_sudo(server, f"fail2ban-client set {jail} unbanip {ip}")
     if r.get("ok"):
         return f"✅ {ip} שוחרר מ-{jail} על {server}"
     return f"❌ כשל: {r.get('stderr', r.get('error'))}"
 
 
-@app.tool()
+@mcp.tool()
 async def fw_crowdsec_decisions(server: str = "all") -> str:
-    """הצג החלטות CrowdSec פעילות (IPs חסומים). server=שם שרת או all."""
+    """הצג החלטות CrowdSec פעילות. server=שם שרת או all."""
     servers = list(FLEET.keys()) if server == "all" else [server]
     lines = ["## 🧠 CrowdSec Decisions\n"]
 
@@ -161,16 +154,16 @@ async def fw_crowdsec_decisions(server: str = "all") -> str:
     return "\n".join(lines)
 
 
-@app.tool()
+@mcp.tool()
 async def fw_crowdsec_remove_decision(server: str, ip: str) -> str:
     """הסר החלטת CrowdSec — שחרר IP."""
     r = ssh_sudo(server, f"cscli decisions delete --ip {ip}")
     if r.get("ok"):
-        return f"✅ {ip} שוחרר מ-CrowdSec על {server}\n```\n{r['stdout']}\n```"
+        return f"✅ {ip} שוחרר מ-CrowdSec על {server}"
     return f"❌ כשל: {r.get('stderr', r.get('error'))}"
 
 
-@app.tool()
+@mcp.tool()
 async def fw_nft_rules(server: str) -> str:
     """הצג חוקי nftables מלאים על שרת."""
     r = ssh_sudo(server, "nft list ruleset 2>/dev/null")
@@ -179,7 +172,7 @@ async def fw_nft_rules(server: str) -> str:
     return f"❌ nft unreachable: {r.get('error')}"
 
 
-@app.tool()
+@mcp.tool()
 async def fw_nft_allow_port(server: str, port: int, protocol: str = "tcp", comment: str = "") -> str:
     """הוסף חוק ACCEPT לפורט ב-nftables INPUT."""
     comment_str = f' comment "{comment}"' if comment else ""
@@ -191,11 +184,11 @@ async def fw_nft_allow_port(server: str, port: int, protocol: str = "tcp", comme
 
     r = ssh_sudo(server, f"nft add rule ip filter INPUT {rule} accept{comment_str}")
     if r.get("ok"):
-        return f"✅ פורט {port}/{protocol} נוסף ל-nftables על {server}{' — ' + comment if comment else ''}"
+        return f"✅ פורט {port}/{protocol} נוסף ל-nftables על {server}"
     return f"❌ כשל: {r.get('stderr', r.get('error'))}"
 
 
-@app.tool()
+@mcp.tool()
 async def fw_block_ip_global(server: str, ip: str, reason: str = "manual block") -> str:
     """חסום IP — CrowdSec + nftables."""
     results = []
@@ -215,7 +208,7 @@ async def fw_block_ip_global(server: str, ip: str, reason: str = "manual block")
     return f"## 🔒 Block {ip} on {server}\n" + "\n".join(results)
 
 
-@app.tool()
+@mcp.tool()
 async def fw_unblock_ip_global(server: str, ip: str) -> str:
     """שחרר IP — CrowdSec + nftables."""
     results = []
@@ -234,8 +227,6 @@ async def fw_unblock_ip_global(server: str, ip: str) -> str:
                 r_del = ssh_sudo(server, f"nft delete rule ip filter INPUT handle {handle}")
                 if r_del.get("ok"):
                     results.append(f"✅ nftables: rule deleted (handle {handle})")
-                else:
-                    results.append(f"⚠️ nftables delete failed: {r_del.get('stderr')}")
                 break
     else:
         results.append(f"ℹ️ nftables: no rule for {ip}")
@@ -243,9 +234,9 @@ async def fw_unblock_ip_global(server: str, ip: str) -> str:
     return f"## 🔓 Unblock {ip} on {server}\n" + "\n".join(results)
 
 
-@app.tool()
+@mcp.tool()
 async def fw_policy_check(server: str) -> str:
-    """בדיקת מדיניות — INPUT policy, פורטים, bouncers."""
+    """בדיקת מדיניות — INPUT policy, פורטים, bouncers, fail2ban."""
     lines = [f"## 🔍 Firewall Policy — {server}\n"]
 
     r = ssh_sudo(server, "nft list chain ip filter INPUT 2>/dev/null | head -3")
@@ -271,7 +262,7 @@ async def fw_policy_check(server: str) -> str:
     return "\n".join(lines)
 
 
-@app.tool()
+@mcp.tool()
 async def fw_add_asterisk_protection(server: str) -> str:
     """הוסף הגנות Asterisk — SIP+RTP ports + fail2ban jail."""
     results = []
@@ -281,7 +272,7 @@ async def fw_add_asterisk_protection(server: str) -> str:
         if r.get("ok"):
             results.append(f"✅ nftables: {desc} ({port}/{proto})")
         else:
-            results.append(f"ℹ️ nftables: {desc} — {r.get('stderr', 'already exists?')}")
+            results.append(f"ℹ️ nftables: {desc} — already exists?")
 
     r_fb = ssh(server, "fail2ban-client status asterisk 2>/dev/null")
     if r_fb.get("ok") and "asterisk" in r_fb.get("stdout", ""):
@@ -292,7 +283,7 @@ async def fw_add_asterisk_protection(server: str) -> str:
     return f"## 🛡️ Asterisk Protection — {server}\n" + "\n".join(results)
 
 
-@app.tool()
+@mcp.tool()
 async def fw_ssh_status() -> str:
     """בדיקת SSH לכל הצי."""
     lines = ["## 🔗 SSH Connectivity\n"]
@@ -312,33 +303,6 @@ async def fw_ssh_status() -> str:
     return "\n".join(lines)
 
 
-# ─── SSE HTTP Server ────────────────────────────────────────────────
-def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
-    sse = SseServerTransport("/messages/")
-
-    async def handle_sse(request):
-        async with sse.connect_sse(
-            request.scope, request.receive, request._send
-        ) as (read_stream, write_stream):
-            await mcp_server.run(
-                read_stream, write_stream, mcp_server.create_initialization_options()
-            )
-
-    return Starlette(
-        debug=debug,
-        routes=[
-            Route("/sse", endpoint=handle_sse),
-            Route("/messages/", endpoint=sse.handle_post_message),
-        ],
-    )
-
-
+# ─── Main ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="mcp-fw SSE server")
-    parser.add_argument("--port", type=int, default=8700, help="Port (default: 8700)")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host (default: 0.0.0.0)")
-    args = parser.parse_args()
-
-    starlette_app = create_starlette_app(app, debug=False)
-    print(f"🔥 mcp-fw SSE server on http://{args.host}:{args.port}/sse")
-    uvicorn.run(starlette_app, host=args.host, port=args.port)
+    mcp.run(transport="sse", host="0.0.0.0", port=8700)
