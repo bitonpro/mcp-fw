@@ -4,10 +4,10 @@ mcp-fw: MCP Firewall Manager
 Fail2ban + CrowdSec + nftables — fleet-wide control via SSH
 
 Uses FastMCP for SSE transport.
-Run: python server.py  (defaults to port 8700)
 """
 
 import subprocess
+import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -23,7 +23,7 @@ FLEET = {
     "5060ihome":  {"host": "100.90.81.47",   "user": "bitonx"},
 }
 
-SSH_TIMEOUT = 15
+SSH_TIMEOUT = int(os.environ.get("FW_SSH_TIMEOUT", "15"))
 
 # ─── MCP Server ─────────────────────────────────────────────────────
 mcp = FastMCP("mcp-fw")
@@ -305,4 +305,8 @@ async def fw_ssh_status() -> str:
 
 # ─── Main ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    mcp.run(transport="sse", host="0.0.0.0", port=8700)
+    host = os.environ.get("FW_HOST", "0.0.0.0")
+    port = int(os.environ.get("FW_PORT", "8700"))
+    mcp.settings.host = host
+    mcp.settings.port = port
+    mcp.run(transport="sse")
